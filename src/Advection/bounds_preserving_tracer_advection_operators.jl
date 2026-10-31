@@ -159,23 +159,37 @@ end
 @inline bounded_tracer_flux_divergence_y(i, j, k, ::AbstractGrid{FT, TX, Flat, TZ}, advection::BoundsPreservingWENO, args...) where {FT, TX, TZ} = zero(FT)
 @inline bounded_tracer_flux_divergence_z(i, j, k, ::AbstractGrid{FT, TX, TY, Flat}, advection::BoundsPreservingWENO, args...) where {FT, TX, TY} = zero(FT)
 
+# The upwind one of the two biased reconstructions at face `i`, rescaled with the limiter of the cell it comes from
+# (the face's left cell, `i - 1`, for `LeftBias`). `upwind_biased_product` weights only that one, so the other is not
+# evaluated.
+@inline function upwind_rescaled_reconstruction_x(i, j, k, grid, advection, u, θ, c)
+    b = bias(u)
+    ĉ = _biased_interpolate_xᶠᵃᵃ(i, j, k, grid, advection, b, c)
+    return rescaled_reconstruction(ĉ, ifelse(b == LeftBias, i-1, i), j, k, grid, θ, c)
+end
+
+@inline function upwind_rescaled_reconstruction_y(i, j, k, grid, advection, v, θ, c)
+    b = bias(v)
+    ĉ = _biased_interpolate_yᵃᶠᵃ(i, j, k, grid, advection, b, c)
+    return rescaled_reconstruction(ĉ, i, ifelse(b == LeftBias, j-1, j), k, grid, θ, c)
+end
+
+@inline function upwind_rescaled_reconstruction_z(i, j, k, grid, advection, w, θ, c)
+    b = bias(w)
+    ĉ = _biased_interpolate_zᵃᵃᶠ(i, j, k, grid, advection, b, c)
+    return rescaled_reconstruction(ĉ, i, j, ifelse(b == LeftBias, k-1, k), grid, θ, c)
+end
+
 @inline function bounded_tracer_flux_divergence_x(i, j, k, grid, advection::BoundsPreservingWENO, ρ, u, c)
     θ = advection.bounds.limiter
 
-    c₊ᴸ = _biased_interpolate_xᶠᵃᵃ(i+1, j, k, grid, advection, LeftBias,  c)
-    c₊ᴿ = _biased_interpolate_xᶠᵃᵃ(i+1, j, k, grid, advection, RightBias, c)
-    c₋ᴸ = _biased_interpolate_xᶠᵃᵃ(i,   j, k, grid, advection, LeftBias,  c)
-    c₋ᴿ = _biased_interpolate_xᶠᵃᵃ(i,   j, k, grid, advection, RightBias, c)
-
-    c₊ᴸ = rescaled_reconstruction(c₊ᴸ, i,   j, k, grid, θ, c)
-    c₊ᴿ = rescaled_reconstruction(c₊ᴿ, i+1, j, k, grid, θ, c)
-    c₋ᴸ = rescaled_reconstruction(c₋ᴸ, i-1, j, k, grid, θ, c)
-    c₋ᴿ = rescaled_reconstruction(c₋ᴿ, i,   j, k, grid, θ, c)
-
     u⁺ = @inbounds u[i+1, j, k]
     u⁻ = @inbounds u[i,   j, k]
-    Ax_ρuc⁺ = ℑxᶠᵃᵃ(i+1, j, k, grid, ρ) * Axᶠᶜᶜ(i+1, j, k, grid) * upwind_biased_product(u⁺, c₊ᴸ, c₊ᴿ)
-    Ax_ρuc⁻ = ℑxᶠᵃᵃ(i,   j, k, grid, ρ) * Axᶠᶜᶜ(i,   j, k, grid) * upwind_biased_product(u⁻, c₋ᴸ, c₋ᴿ)
+    c⁺ = upwind_rescaled_reconstruction_x(i+1, j, k, grid, advection, u⁺, θ, c)
+    c⁻ = upwind_rescaled_reconstruction_x(i,   j, k, grid, advection, u⁻, θ, c)
+
+    Ax_ρuc⁺ = ℑxᶠᵃᵃ(i+1, j, k, grid, ρ) * Axᶠᶜᶜ(i+1, j, k, grid) * upwind_biased_product(u⁺, c⁺, c⁺)
+    Ax_ρuc⁻ = ℑxᶠᵃᵃ(i,   j, k, grid, ρ) * Axᶠᶜᶜ(i,   j, k, grid) * upwind_biased_product(u⁻, c⁻, c⁻)
 
     return Ax_ρuc⁺ - Ax_ρuc⁻
 end
@@ -183,20 +197,13 @@ end
 @inline function bounded_tracer_flux_divergence_y(i, j, k, grid, advection::BoundsPreservingWENO, ρ, v, c)
     θ = advection.bounds.limiter
 
-    c₊ᴸ = _biased_interpolate_yᵃᶠᵃ(i, j+1, k, grid, advection, LeftBias,  c)
-    c₊ᴿ = _biased_interpolate_yᵃᶠᵃ(i, j+1, k, grid, advection, RightBias, c)
-    c₋ᴸ = _biased_interpolate_yᵃᶠᵃ(i, j,   k, grid, advection, LeftBias,  c)
-    c₋ᴿ = _biased_interpolate_yᵃᶠᵃ(i, j,   k, grid, advection, RightBias, c)
-
-    c₊ᴸ = rescaled_reconstruction(c₊ᴸ, i, j,   k, grid, θ, c)
-    c₊ᴿ = rescaled_reconstruction(c₊ᴿ, i, j+1, k, grid, θ, c)
-    c₋ᴸ = rescaled_reconstruction(c₋ᴸ, i, j-1, k, grid, θ, c)
-    c₋ᴿ = rescaled_reconstruction(c₋ᴿ, i, j,   k, grid, θ, c)
-
     v⁺ = @inbounds v[i, j+1, k]
     v⁻ = @inbounds v[i, j,   k]
-    Ay_ρvc⁺ = ℑyᵃᶠᵃ(i, j+1, k, grid, ρ) * Ayᶜᶠᶜ(i, j+1, k, grid) * upwind_biased_product(v⁺, c₊ᴸ, c₊ᴿ)
-    Ay_ρvc⁻ = ℑyᵃᶠᵃ(i, j,   k, grid, ρ) * Ayᶜᶠᶜ(i, j,   k, grid) * upwind_biased_product(v⁻, c₋ᴸ, c₋ᴿ)
+    c⁺ = upwind_rescaled_reconstruction_y(i, j+1, k, grid, advection, v⁺, θ, c)
+    c⁻ = upwind_rescaled_reconstruction_y(i, j,   k, grid, advection, v⁻, θ, c)
+
+    Ay_ρvc⁺ = ℑyᵃᶠᵃ(i, j+1, k, grid, ρ) * Ayᶜᶠᶜ(i, j+1, k, grid) * upwind_biased_product(v⁺, c⁺, c⁺)
+    Ay_ρvc⁻ = ℑyᵃᶠᵃ(i, j,   k, grid, ρ) * Ayᶜᶠᶜ(i, j,   k, grid) * upwind_biased_product(v⁻, c⁻, c⁻)
 
     return Ay_ρvc⁺ - Ay_ρvc⁻
 end
@@ -204,20 +211,13 @@ end
 @inline function bounded_tracer_flux_divergence_z(i, j, k, grid, advection::BoundsPreservingWENO, ρ, w, c)
     θ = advection.bounds.limiter
 
-    c₊ᴸ = _biased_interpolate_zᵃᵃᶠ(i, j, k+1, grid, advection, LeftBias,  c)
-    c₊ᴿ = _biased_interpolate_zᵃᵃᶠ(i, j, k+1, grid, advection, RightBias, c)
-    c₋ᴸ = _biased_interpolate_zᵃᵃᶠ(i, j, k,   grid, advection, LeftBias,  c)
-    c₋ᴿ = _biased_interpolate_zᵃᵃᶠ(i, j, k,   grid, advection, RightBias, c)
-
-    c₊ᴸ = rescaled_reconstruction(c₊ᴸ, i, j, k,   grid, θ, c)
-    c₊ᴿ = rescaled_reconstruction(c₊ᴿ, i, j, k+1, grid, θ, c)
-    c₋ᴸ = rescaled_reconstruction(c₋ᴸ, i, j, k-1, grid, θ, c)
-    c₋ᴿ = rescaled_reconstruction(c₋ᴿ, i, j, k,   grid, θ, c)
-
     w⁺ = @inbounds w[i, j, k+1]
     w⁻ = @inbounds w[i, j, k]
-    Az_ρwc⁺ = ℑzᵃᵃᶠ(i, j, k+1, grid, ρ) * Azᶜᶜᶠ(i, j, k+1, grid) * upwind_biased_product(w⁺, c₊ᴸ, c₊ᴿ)
-    Az_ρwc⁻ = ℑzᵃᵃᶠ(i, j, k,   grid, ρ) * Azᶜᶜᶠ(i, j, k,   grid) * upwind_biased_product(w⁻, c₋ᴸ, c₋ᴿ)
+    c⁺ = upwind_rescaled_reconstruction_z(i, j, k+1, grid, advection, w⁺, θ, c)
+    c⁻ = upwind_rescaled_reconstruction_z(i, j, k,   grid, advection, w⁻, θ, c)
+
+    Az_ρwc⁺ = ℑzᵃᵃᶠ(i, j, k+1, grid, ρ) * Azᶜᶜᶠ(i, j, k+1, grid) * upwind_biased_product(w⁺, c⁺, c⁺)
+    Az_ρwc⁻ = ℑzᵃᵃᶠ(i, j, k,   grid, ρ) * Azᶜᶜᶠ(i, j, k,   grid) * upwind_biased_product(w⁻, c⁻, c⁻)
 
     return Az_ρwc⁺ - Az_ρwc⁻
 end
