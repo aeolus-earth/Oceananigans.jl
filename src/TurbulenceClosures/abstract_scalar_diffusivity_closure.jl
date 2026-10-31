@@ -289,17 +289,26 @@ const VITD = VerticallyImplicitTimeDiscretization
 # with the formulation of the tridiagonal solver, which requires explicit treatment
 # of boundary contributions (eg boundary contributions must be moved to the right
 # hand side of the tridiagonal system).
+#
+# The explicit flux is evaluated on the two boundary faces only: a branch on `k`, not an `ifelse`, which would
+# evaluate it (diffusivity and field loads, a vertical derivative) on every face of every cell and discard it on
+# all but two. The value returned is the same either way. The condition depends on `k` alone, so it is uniform
+# over a group of GPU threads at one level.
 
 @inline function viscous_flux_uz(i, j, k, grid::VerticallyBoundedGrid, ::VITD, closure::AIDorAVD, K, clk, fields, b)
-    return ifelse((k == 1) | (k == grid.Nz+1),
-                  viscous_flux_uz(i, j, k, grid, ExplicitTimeDiscretization(), closure, K, clk, fields, b),
-                  ivd_viscous_flux_uz(i, j, k, grid, closure, K, clk, fields, b))
+    if (k == 1) | (k == grid.Nz+1)
+        return viscous_flux_uz(i, j, k, grid, ExplicitTimeDiscretization(), closure, K, clk, fields, b)
+    else
+        return ivd_viscous_flux_uz(i, j, k, grid, closure, K, clk, fields, b)
+    end
 end
 
 @inline function viscous_flux_vz(i, j, k, grid::VerticallyBoundedGrid, ::VITD, closure::AIDorAVD, K, clk, fields, b)
-    return ifelse((k == 1) | (k == grid.Nz+1),
-                  viscous_flux_vz(i, j, k, grid, ExplicitTimeDiscretization(), closure, K, clk, fields, b),
-                  ivd_viscous_flux_vz(i, j, k, grid, closure, K, clk, fields, b))
+    if (k == 1) | (k == grid.Nz+1)
+        return viscous_flux_vz(i, j, k, grid, ExplicitTimeDiscretization(), closure, K, clk, fields, b)
+    else
+        return ivd_viscous_flux_vz(i, j, k, grid, closure, K, clk, fields, b)
+    end
 end
 
 # Every vertical flux of w is an interior flux between two faces, which the tridiagonal solver represents
@@ -307,9 +316,11 @@ end
 @inline viscous_flux_wz(i, j, k, grid::VerticallyBoundedGrid, ::VITD, closure::AIDorAVD, K, clk, fields, b) = zero(grid)
 
 @inline function diffusive_flux_z(i, j, k, grid::VerticallyBoundedGrid, ::VITD, closure::AIDorAVD, K, id, c, clk, fields, b)
-    return ifelse((k == 1) | (k == grid.Nz+1),
-                  diffusive_flux_z(i, j, k, grid, ExplicitTimeDiscretization(), closure, K, id, c, clk, fields, b),
-                  zero(grid))
+    if (k == 1) | (k == grid.Nz+1)
+        return diffusive_flux_z(i, j, k, grid, ExplicitTimeDiscretization(), closure, K, id, c, clk, fields, b)
+    else
+        return zero(grid)
+    end
 end
 
 #####
