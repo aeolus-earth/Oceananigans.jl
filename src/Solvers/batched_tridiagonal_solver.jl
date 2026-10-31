@@ -1,5 +1,6 @@
 using Oceananigans.Architectures: on_architecture
 using Oceananigans.Grids: XDirection, YDirection, ZDirection
+using KernelAbstractions.NDIteration: StaticSize, _Size
 
 """
     struct BatchedTridiagonalSolver{A, B, C, T, G, P}
@@ -215,6 +216,12 @@ end
         end
     end
 end
+
+# Launched 32 × 8 rather than 16 × 16 (the GPU default for three-dimensional grids): each thread sweeps one line, so a
+# warp covers 32 consecutive lines, contiguous in memory for the `ZDirection` solve over `:xy`. (After the first
+# `@kernel` above, which defines the kernel's constructors.)
+solve_batched_tridiagonal_system_kernel!(dev, ::StaticSize{(16, 16)}, worksize::_Size) =
+    solve_batched_tridiagonal_system_kernel!(dev, StaticSize((32, 8)), worksize)
 
 @kernel function solve_batched_tridiagonal_system_kernel!(ϕ, a, b, c, f, t, grid, p, args, tridiagonal_direction::ZDirection)
     Nz = size(grid, 3)
