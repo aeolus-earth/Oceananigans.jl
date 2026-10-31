@@ -16,6 +16,8 @@ else
     const cuFFT = CUDA.CUFFT
 end
 using GPUArraysCore: allowscalar
+using Adapt: Adapt
+using OffsetArrays: OffsetArray
 using Oceananigans.Utils: linear_expand, __linear_ndrange, MappedCompilerMetadata
 
 import Oceananigans.Architectures as AC
@@ -106,8 +108,126 @@ AC.unified_array(::CUDAGPU, a::AbstractArray) = map(eltype(a), cu(a; unified = t
     return dst
 end
 
-@inline AC.convert_to_device(::CUDAGPU, args) = CUDA.cudaconvert(args)
-@inline AC.convert_to_device(::CUDAGPU, args::Tuple) = map(CUDA.cudaconvert, args)
+#####
+##### 32-bit index arithmetic for kernel arguments
+#####
+##### On the device a `Field` is an `OffsetArray` over a `CuDeviceArray`, whose index arithmetic is 64-bit: every
+##### `c[i, j, k]` subtracts Int64 offsets and forms the linear index with Int64 multiplies by runtime strides, which
+##### the GPU executes as several 32-bit integer instructions each. In stencil-heavy kernels this address arithmetic
+##### is a quarter to a third of all instructions. With `AC.INT32_INDEXING[]`, `convert_to_device` therefore replaces
+##### the `CuDeviceArray` parent of every `OffsetArray` kernel argument (fields, grid metrics, and any struct Adapt
+##### traverses) by an `Int32IndexedArray`: the same pointer and element type with `Int32` dimensions, whose linear
+##### index is computed in `Int32` and widened once for the address. The memory, the values and the order of
+##### operations are the same; only the integer instructions change. The `OffsetArray` wrapper stays, so offsets,
+##### axes, `parent` and linear indexing keep their semantics. An argument array of `typemax(Int32)` or more
+##### elements (its linear index needs 64 bits) raises an `ArgumentError`.
+#####
+
+"""
+    Int32IndexedArray{T, N, A}
+
+A device array (the parent of an `OffsetArray` kernel argument) whose index arithmetic is done in `Int32`:
+the pointer of a `CuDeviceArray` and its dimensions as `Int32`. Built by `convert_to_device` only for arrays of
+fewer than `typemax(Int32)` elements.
+"""
+struct Int32IndexedArray{T, N, A} <: DenseArray{T, N}
+    ptr :: Core.LLVMPtr{T, A}
+    dims :: NTuple{N, Int32}
+end
+
+Base.size(a::Int32IndexedArray) = map(Int, a.dims)
+Base.IndexStyle(::Type{<:Int32IndexedArray}) = IndexLinear()
+Base.elsize(::Type{<:Int32IndexedArray{T}}) where T = sizeof(T)
+Base.pointer(a::Int32IndexedArray{T}, i::Integer = 1) where T = a.ptr + (Int(i) - 1) * sizeof(T)
+Base.unsafe_convert(::Type{Core.LLVMPtr{T, A}}, a::Int32IndexedArray{T, <:Any, A}) where {T, A} = a.ptr
+
+# 0-based linear index of the 1-based indices `I`, in Int32: (i₁ - 1) + d₁ ((i₂ - 1) + d₂ (…)).
+@inline int32_linear_index(::Tuple{}, ::Tuple{}) = Int32(0)
+@inline int32_linear_index(dims::Tuple, I::Tuple) =
+    ((first(I) % Int32) - Int32(1)) + first(dims) * int32_linear_index(Base.tail(dims), Base.tail(I))
+
+# The element at 0-based linear index ℓ: `unsafe_load(ptr, n)` addresses ptr + (n - 1), so n = Int(ℓ) + 1 folds to
+# a single sign extension of ℓ. Alignment as `CuDeviceArray` (`Base.datatype_alignment`).
+@inline load_int32_indexed(a::Int32IndexedArray{T}, ℓ::Int32) where T =
+    unsafe_load(a.ptr, Int(ℓ) + 1, Val(Base.datatype_alignment(T)))
+@inline store_int32_indexed!(a::Int32IndexedArray{T}, x, ℓ::Int32) where T =
+    unsafe_store!(a.ptr, convert(T, x), Int(ℓ) + 1, Val(Base.datatype_alignment(T)))
+
+# A simplified bounds check as `CuDeviceArray`'s (on the linear index; elided under `@inbounds`).
+@inline in_int32_bounds(a::Int32IndexedArray, ℓ::Int32) = (ℓ % UInt32) < (prod(a.dims) % UInt32)
+
+Base.@propagate_inbounds function Base.getindex(a::Int32IndexedArray, i::Integer)
+    ℓ = (i % Int32) - Int32(1)
+    @boundscheck in_int32_bounds(a, ℓ) || Base.throw_boundserror(a, (i,))
+    return load_int32_indexed(a, ℓ)
+end
+
+Base.@propagate_inbounds function Base.getindex(a::Int32IndexedArray{T, N}, I::Vararg{Integer, N}) where {T, N}
+    ℓ = int32_linear_index(a.dims, I)
+    @boundscheck in_int32_bounds(a, ℓ) || Base.throw_boundserror(a, I)
+    return load_int32_indexed(a, ℓ)
+end
+
+Base.@propagate_inbounds function Base.setindex!(a::Int32IndexedArray, x, i::Integer)
+    ℓ = (i % Int32) - Int32(1)
+    @boundscheck in_int32_bounds(a, ℓ) || Base.throw_boundserror(a, (i,))
+    store_int32_indexed!(a, x, ℓ)
+    return a
+end
+
+Base.@propagate_inbounds function Base.setindex!(a::Int32IndexedArray{T, N}, x, I::Vararg{Integer, N}) where {T, N}
+    ℓ = int32_linear_index(a.dims, I)
+    @boundscheck in_int32_bounds(a, ℓ) || Base.throw_boundserror(a, I)
+    store_int32_indexed!(a, x, ℓ)
+    return a
+end
+
+# One index on a vector: the linear methods (disambiguates the two above).
+Base.@propagate_inbounds function Base.getindex(a::Int32IndexedArray{T, 1}, i::Integer) where T
+    ℓ = (i % Int32) - Int32(1)
+    @boundscheck in_int32_bounds(a, ℓ) || Base.throw_boundserror(a, (i,))
+    return load_int32_indexed(a, ℓ)
+end
+
+Base.@propagate_inbounds function Base.setindex!(a::Int32IndexedArray{T, 1}, x, i::Integer) where T
+    ℓ = (i % Int32) - Int32(1)
+    @boundscheck in_int32_bounds(a, ℓ) || Base.throw_boundserror(a, (i,))
+    store_int32_indexed!(a, x, ℓ)
+    return a
+end
+
+struct Int32Indexing end
+
+@noinline function throw_int32_indexing_error(len)
+    throw(ArgumentError("a kernel argument array has $len elements, more than 32-bit index arithmetic can address " *
+                        "($(typemax(Int32))); set `Oceananigans.Architectures.INT32_INDEXING[] = false` " *
+                        "to use 64-bit indices."))
+end
+
+"""
+    int32_indexed_parent(p)
+
+The parent an `OffsetArray` kernel argument gets on the device: an [`Int32IndexedArray`](@ref) over the memory of
+the `CuDeviceArray` `p` (an `ArgumentError` if `p` has `typemax(Int32)` or more elements), any other parent as is.
+"""
+int32_indexed_parent(p) = p
+
+@inline function int32_indexed_parent(p::CuDeviceArray{T, N, A}) where {T, N, A}
+    length(p) < typemax(Int32) || throw_int32_indexing_error(length(p))
+    return Int32IndexedArray{T, N, A}(pointer(p), map(Int32, size(p)))
+end
+
+function Adapt.adapt_structure(::Int32Indexing, a::OffsetArray{T, N, <:CuDeviceArray}) where {T, N}
+    p = int32_indexed_parent(parent(a))
+    return OffsetArray{T, N, typeof(p)}(p, a.offsets)
+end
+
+# A converted kernel argument with 32-bit index arithmetic when `AC.INT32_INDEXING[]` is on. The result is in
+# device form (an `OffsetArray` over an `Int32IndexedArray` is `isbits` and `cudaconvert` returns it unchanged).
+@inline int32_indexed(x) = AC.INT32_INDEXING[] ? Adapt.adapt(Int32Indexing(), x) : x
+
+@inline AC.convert_to_device(::CUDAGPU, args) = int32_indexed(CUDA.cudaconvert(args))
+@inline AC.convert_to_device(::CUDAGPU, args::Tuple) = map(arg -> int32_indexed(CUDA.cudaconvert(arg)), args)
 
 BC.validate_boundary_condition_architecture(::CuArray, ::AC.GPU, bc, side) = nothing
 

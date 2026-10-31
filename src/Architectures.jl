@@ -137,6 +137,16 @@ unified_array(::GPU, a) = a
 #     for closures that are self-referential through a `Core.Box`.
 @inline Adapt.adapt(::CPU, f::Function) = f
 
+"""
+    INT32_INDEXING
+
+Whether CUDA kernels launched with `launch!` index their array arguments with 32-bit integer arithmetic (`true` by
+default). `convert_to_device` then gives every `OffsetArray` argument a parent whose linear index is computed in
+`Int32`: the same memory and values, fewer integer instructions. An argument array of `typemax(Int32)` or more
+elements raises an `ArgumentError`; set `Oceananigans.Architectures.INT32_INDEXING[] = false` for 64-bit indices.
+"""
+const INT32_INDEXING = Ref(true)
+
 # Convert arguments to device-compatible types
 @inline convert_to_device(arch, args)  = args
 @inline convert_to_device(::CPU, args) = Adapt.adapt(CPU(), args)
